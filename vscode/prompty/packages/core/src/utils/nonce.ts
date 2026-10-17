@@ -3,14 +3,12 @@
  *
  * @remarks This function is primarily used to help enforce content security
  * policies for resources/scripts being executed in a webview context.
+ * Uses crypto.randomBytes for CSPRNG-level unpredictability.
  *
  * @returns A nonce
  */
+import { randomBytes } from 'crypto';
+
 export function getNonce() {
-	let text = "";
-	const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-	for (let i = 0; i < 32; i++) {
-		text += possible.charAt(Math.floor(Math.random() * possible.length));
-	}
-	return text;
+	return randomBytes(16).toString('hex');
 }

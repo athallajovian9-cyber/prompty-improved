@@ -6,11 +6,13 @@ import '@prompty/openai';
 import '@prompty/foundry';
 import '@prompty/anthropic';
 import * as path from 'path';
-import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import { load as loadYaml } from 'js-yaml';
 import { ConnectionStore } from '../connections/store';
 import { ConnectionProviderRegistry } from '../connections/registry';
 import { ChatPanel } from './chatPanel';
+import { isAsyncIterable, tryFormatJsonString } from '../utils/markdown';
+import { redactSecretsInText } from '../utils/redact';
 
 function hasStructuredOutputs(agent: PromptAgent | undefined): boolean {
 	if (!agent) {return false;}
@@ -19,23 +21,6 @@ function hasStructuredOutputs(agent: PromptAgent | undefined): boolean {
 	const outputSchema = record.outputSchema;
 	if (!outputSchema || typeof outputSchema !== 'object') {return false;}
 	return Object.keys(outputSchema).length > 0;
-}
-
-/** Check if a value is an async iterable (i.e. a streaming response). */
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-	return value != null && typeof value === 'object' && Symbol.asyncIterator in value;
-}
-
-function tryFormatJsonString(value: string): string | undefined {
-	const trimmed = value.trim();
-	if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
-		return undefined;
-	}
-	try {
-		return JSON.stringify(JSON.parse(trimmed), null, 2);
-	} catch {
-		return undefined;
-	}
 }
 
 function formatRunResult(result: unknown, structured: boolean): string {
@@ -54,8 +39,8 @@ function getInputSeedValue(prop: Record<string, unknown>): unknown {
 	return prop.sample;
 }
 
-function readFrontmatter(filePath: string): Record<string, unknown> | undefined {
-	const raw = fs.readFileSync(filePath, 'utf-8');
+async function readFrontmatter(filePath: string): Promise<Record<string, unknown> | undefined> {
+	const raw = await fsp.readFile(filePath, 'utf-8');
 	const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
 	if (!match) {return undefined;}
 	const parsed = loadYaml(match[1]);
@@ -113,7 +98,7 @@ export class PromptyController implements Disposable {
 		let agent: PromptAgent | undefined;
 
 		try {
-			this.loadEnvFile(filePath);
+			await this.loadEnvFile(filePath);
 			await this.bridgeConnections();
 
 			// Register file tracer only — no verbose output channel trace
@@ -122,7 +107,7 @@ export class PromptyController implements Disposable {
 			// Load agent first so we can apply sidebar connections
 			agent = load(filePath);
 			await this.applyDefaultConnection(agent);
-			const frontmatter = readFrontmatter(filePath);
+			const frontmatter = await readFrontmatter(filePath);
 
 			// Build sample inputs from example values on inputSchema properties.
 			// This is extension-only behavior — the core runtime does NOT treat
@@ -254,7 +239,7 @@ export class PromptyController implements Disposable {
 			// Build a descriptive error message
 			let message: string;
 			if (error instanceof Error) {
-				message = error.message;
+				message = redactSecretsInText(error.message);
 
 				// OpenAI SDK errors carry extra context
 				const errRecord = error as unknown as Record<string, unknown>;
@@ -294,7 +279,7 @@ export class PromptyController implements Disposable {
 			}
 
 			this.outputChannel.appendLine(`\n✗ ${message}`);
-			window.showErrorMessage(`Prompty: ${error instanceof Error ? error.message : message}`);
+			window.showErrorMessage(`Prompty: ${message}`);
 		}
 	}
 
@@ -430,54 +415,51 @@ export class PromptyController implements Disposable {
 		}
 	}
 
-	private loadEnvFile(promptyFilePath: string) {
+	private async loadEnvFile(promptyFilePath: string): Promise<void> {
 		const workspaceFolders = workspace.workspaceFolders;
-		if (!workspaceFolders) {
-			return;
-		}
+		if (!workspaceFolders) {return;}
 
-		let searchDir = path.dirname(promptyFilePath);
 		const workspaceRoot = workspaceFolders[0].uri.fsPath;
+		let searchDir = path.dirname(promptyFilePath);
 
-		while (searchDir.length >= workspaceRoot.length) {
-			const envPath = path.join(searchDir, '.env');
-			if (fs.existsSync(envPath)) {
-				this.parseEnvFile(envPath);
-				return;
-			}
+		const relative = path.relative(workspaceRoot, searchDir);
+		if (relative.startsWith('..') || path.isAbsolute(relative)) {return;}
+
+		for (;;) {
+			if (await this.parseEnvFile(path.join(searchDir, '.env'))) {return;}
+			if (path.relative(workspaceRoot, searchDir) === '') {return;}
 			const parent = path.dirname(searchDir);
-			if (parent === searchDir) {
-				break;
-			}
+			if (parent === searchDir) {return;}
 			searchDir = parent;
 		}
 	}
 
-	private parseEnvFile(envPath: string) {
+	/** @returns true if a .env file exists at envPath (even if unreadable), false if not found. */
+	private async parseEnvFile(envPath: string): Promise<boolean> {
+		let content: string;
 		try {
-			const content = fs.readFileSync(envPath, 'utf-8');
-			for (const line of content.split(/\r?\n/)) {
-				const trimmed = line.trim();
-				if (!trimmed || trimmed.startsWith('#')) {
-					continue;
-				}
-				const eqIndex = trimmed.indexOf('=');
-				if (eqIndex === -1) {
-					continue;
-				}
-				const key = trimmed.slice(0, eqIndex).trim();
-				let value = trimmed.slice(eqIndex + 1).trim();
-				if ((value.startsWith('"') && value.endsWith('"')) ||
-					(value.startsWith("'") && value.endsWith("'"))) {
-					value = value.slice(1, -1);
-				}
-				if (!process.env[key]) {
-					process.env[key] = value;
-				}
-			}
-		} catch {
-			// Ignore errors reading .env file
+			content = await fsp.readFile(envPath, 'utf-8');
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {return false;}
+			this.outputChannel.appendLine(
+				`Warning: could not read ${envPath}: ${error instanceof Error ? error.message : String(error)}`
+			);
+			return true;
 		}
+		for (const line of content.split(/\r?\n/)) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith('#')) {continue;}
+			const eqIndex = trimmed.indexOf('=');
+			if (eqIndex === -1) {continue;}
+			const key = trimmed.slice(0, eqIndex).trim();
+			let value = trimmed.slice(eqIndex + 1).trim();
+			if ((value.startsWith('"') && value.endsWith('"')) ||
+				(value.startsWith("'") && value.endsWith("'"))) {
+				value = value.slice(1, -1);
+			}
+			if (!process.env[key]) {process.env[key] = value;}
+		}
+		return true;
 	}
 
 	dispose(): void {

@@ -3,8 +3,10 @@ import {
 	IConnectionProvider,
 	ConnectionProfile,
 	ConnectionProviderType,
+	ConnectionTestResult,
 	ProviderRegistration,
 } from "./types";
+import { redactSecretsInText } from '../utils/redact';
 
 /**
  * Central registry for connection providers.
@@ -24,6 +26,19 @@ export class ConnectionProviderRegistry {
 	 * @returns A disposable that unregisters the provider when disposed.
 	 */
 	registerProvider(provider: IConnectionProvider): ProviderRegistration {
+		if (
+			!provider ||
+			typeof provider.id !== 'string' || provider.id.length === 0 ||
+			!Array.isArray(provider.providerTypes) || provider.providerTypes.length === 0 ||
+			provider.providerTypes.some((t) => typeof t !== 'string') ||
+			typeof provider.getConfigurationFields !== 'function' ||
+			typeof provider.testConnection !== 'function' ||
+			typeof provider.createClient !== 'function'
+		) {
+			throw new Error(
+				'Invalid connection provider: id, providerTypes, getConfigurationFields, testConnection and createClient are required.'
+			);
+		}
 		if (this.providers.has(provider.id)) {
 			throw new Error(
 				`Connection provider "${provider.id}" is already registered.`
@@ -33,6 +48,7 @@ export class ConnectionProviderRegistry {
 		this._onProvidersChanged.fire(this.getAllProviders());
 
 		return new vscode.Disposable(() => {
+			if (this.providers.get(provider.id) !== provider) {return;}
 			this.providers.delete(provider.id);
 			this._onProvidersChanged.fire(this.getAllProviders());
 		});
@@ -64,7 +80,7 @@ export class ConnectionProviderRegistry {
 	async testConnection(
 		profile: ConnectionProfile,
 		secret?: string
-	): Promise<{ success: boolean; message: string }> {
+	): Promise<ConnectionTestResult> {
 		const provider = this.getProviderForType(profile.providerType);
 		if (!provider) {
 			return {
@@ -72,7 +88,14 @@ export class ConnectionProviderRegistry {
 				message: `No provider registered for type "${profile.providerType}"`,
 			};
 		}
-		return provider.testConnection(profile, secret);
+		try {
+			return await provider.testConnection(profile, secret);
+		} catch (error: unknown) {
+			return {
+				success: false,
+				message: redactSecretsInText(error instanceof Error ? error.message : String(error)),
+			};
+		}
 	}
 
 	/** Create a client for a connection */

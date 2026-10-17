@@ -1,10 +1,10 @@
 import { ExtensionContext, TextEditor, ViewColumn, WebviewPanel, window, workspace, Disposable, RelativePattern } from 'vscode';
 import { load, prepare, Message, text as textPart } from '@prompty/core';
 import type { Prompty } from '@prompty/core';
-import { marked } from 'marked';
 import * as path from 'path';
 import { redactSecrets, redactSecretValue, isSensitiveKey } from '../utils/redact';
 import { getNonce } from '../utils/nonce';
+import { renderSafeMarkdown, escapeHtml } from '../utils/markdown';
 
 /**
  * Side-by-side preview panel for .prompty files.
@@ -134,7 +134,7 @@ export class PreviewPanel implements Disposable {
 		const messageCards = messages.map((msg) => {
 			const role = msg.role ?? 'unknown';
 			const content = msg.text || '(empty)';
-			const rendered = marked.parse(content, { async: false }) as string;
+			const rendered = renderSafeMarkdown(content, false);
 			return { role, html: `<div class="message ${escapeHtml(role)}">
 				<div class="role-label">${escapeHtml(role)}</div>
 				<div class="content">${rendered}</div>
@@ -534,10 +534,6 @@ export class PreviewPanel implements Disposable {
 		this.disposables.forEach(d => d.dispose());
 		this.disposables = [];
 	}
-}
-
-function escapeHtml(s: string): string {
-	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function truncate(s: string, max: number): string {

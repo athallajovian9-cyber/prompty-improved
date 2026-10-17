@@ -85,3 +85,28 @@ export function isSensitiveKey(key: string): boolean {
 		.filter(Boolean);
 	return tokens.includes('auth');
 }
+
+/** URI with embedded user:password@ credentials */
+const URI_CREDENTIALS = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/g;
+
+/** Known secret formats matched as substrings inside free text (error messages, logs) */
+const TEXT_SECRET_PATTERNS: RegExp[] = [
+	/\bsk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9._-]{8,}/g,
+	/\bgh[pousr]_[A-Za-z0-9_]{8,}/g,
+	/\bgithub_pat_[A-Za-z0-9_]+/g,
+	/\bAKIA[0-9A-Z]{16}\b/g,
+	/\bxox[baprs]-[A-Za-z0-9-]+/g,
+	/\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+	/\bAIza[0-9A-Za-z_-]{35}\b/g,
+	/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi,
+	/(?:AccountKey|SharedAccessKey|SharedAccessSignature|api[-_]?key)\s*[=:]\s*[^;\s,"']+/gi,
+];
+
+/** Scrub secrets embedded anywhere inside free text (error messages, logs). */
+export function redactSecretsInText(text: string): string {
+	let result = text.replace(URI_CREDENTIALS, '$1[redacted]@');
+	for (const pattern of TEXT_SECRET_PATTERNS) {
+		result = result.replace(pattern, '[redacted]');
+	}
+	return result;
+}

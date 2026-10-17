@@ -7,14 +7,15 @@ import type { PromptAgent } from '@prompty/core';
 import '@prompty/openai';
 import '@prompty/foundry';
 import '@prompty/anthropic';
-import { marked } from 'marked';
+import { renderSafeMarkdown, escapeHtml, isAsyncIterable, tryFormatJsonString } from '../utils/markdown';
+import { redactSecretsInText } from '../utils/redact';
 import * as path from 'path';
 import { getNonce } from '../utils/nonce';
 import { ConnectionStore } from '../connections/store';
 import { ConnectionProviderRegistry } from '../connections/registry';
 
 /** Render markdown to HTML for the chat webview. Detects image URLs and embeds them. */
-function renderMarkdown(content: string): string {
+function renderMarkdown(content: string, allowImages: boolean): string {
 	const formattedJson = tryFormatJsonString(content);
 	if (formattedJson) {
 		return renderJsonBlock(formattedJson);
@@ -25,25 +26,13 @@ function renderMarkdown(content: string): string {
 	const lines = content.split('\n');
 	const transformed = lines.map(line => {
 		const trimmed = line.trim();
-		if (imageUrlPattern.test(trimmed)) {
+		if (allowImages && imageUrlPattern.test(trimmed)) {
 			return `![Generated image](${trimmed})`;
 		}
 		return line;
 	}).join('\n');
 
-	return marked.parse(transformed, { async: false }) as string;
-}
-
-function escapeHtml(content: string): string {
-	return content
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;');
-}
-
-/** Check if a value is an async iterable (i.e. a streaming response). */
-function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
-	return value != null && typeof value === 'object' && Symbol.asyncIterator in value;
+	return renderSafeMarkdown(transformed, allowImages);
 }
 
 function hasStructuredOutputs(agent: PromptAgent): boolean {
@@ -52,18 +41,6 @@ function hasStructuredOutputs(agent: PromptAgent): boolean {
 	const outputSchema = record.outputSchema;
 	if (!outputSchema || typeof outputSchema !== 'object') {return false;}
 	return Object.keys(outputSchema).length > 0;
-}
-
-function tryFormatJsonString(value: string): string | undefined {
-	const trimmed = value.trim();
-	if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
-		return undefined;
-	}
-	try {
-		return JSON.stringify(JSON.parse(trimmed), null, 2);
-	} catch {
-		return undefined;
-	}
 }
 
 function colorizeJson(json: string): string {
@@ -83,11 +60,11 @@ function renderJsonBlock(json: string): string {
 	return `<pre class="json-block"><code class="language-json">${colorizeJson(json)}</code></pre>`;
 }
 
-function formatAssistantResult(result: unknown, structured: boolean): { text: string; html: string } {
+function formatAssistantResult(result: unknown, structured: boolean, allowImages: boolean): { text: string; html: string } {
 	const text = typeof result === 'string'
 		? structured ? tryFormatJsonString(result) ?? result : result
 		: JSON.stringify(result, null, 2);
-	const html = renderMarkdown(text);
+	const html = renderMarkdown(text, allowImages);
 	return { text, html };
 }
 
@@ -138,6 +115,10 @@ export class ChatPanel {
 	private promptyTracer: PromptyTracer;
 	private hasTools: boolean;
 	private structuredOutputs: boolean;
+	private allowImages: boolean;
+	private busy = false;
+	private pendingToolCalls = new Map<string, (value: string) => void>();
+	private toolCallSeq = 0;
 	private sessionSpan: ReturnType<typeof Tracer.start> | undefined;
 	private turnCount = 0;
 	private sentInitialConversation = false;
@@ -186,6 +167,7 @@ export class ChatPanel {
 		this.sampleInputs = { ...sampleInputs };
 		this.hasTools = (agent.tools?.length ?? 0) > 0;
 		this.structuredOutputs = hasStructuredOutputs(agent);
+		this.allowImages = (agent.model as { apiType?: string } | undefined)?.apiType === 'image';
 		this.conversation = toChatMessages(this.sampleInputs[this.threadInputName]);
 
 		// Enable streaming for the chat panel — better UX for interactive use.
@@ -199,7 +181,7 @@ export class ChatPanel {
 		}
 
 		this.promptyTracer = new PromptyTracer({ outputDir: runsDir });
-		Tracer.add('prompty-chat', this.promptyTracer.factory);
+		Tracer.add(`prompty-chat:${this.filePath}`, this.promptyTracer.factory);
 
 		// Start a single root span for the entire chat session.
 		// All user turns become child spans. The .tracy file is written
@@ -223,20 +205,12 @@ export class ChatPanel {
 		this.panel.webview.html = this.getHtml();
 
 		this.panel.webview.onDidReceiveMessage(async (msg) => {
-			switch (msg.command) {
-				case 'ready':
-					// Send system prompt context on load
-					await this.sendSystemContext();
-					break;
-				case 'sendMessage':
-					await this.handleUserMessage(msg.text);
-					break;
-				case 'endChat':
-					await this.endChat();
-					break;
-				case 'toolCallResponse':
-					// Handled via promise resolver in handleToolCall
-					break;
+			try {
+				await this.handleWebviewMessage(msg);
+			} catch (error: unknown) {
+				const message = redactSecretsInText(error instanceof Error ? error.message : String(error));
+				console.error('[Prompty] webview message failed:', message);
+				this.postMessage({ command: 'addError', content: message });
 			}
 		});
 
@@ -245,18 +219,53 @@ export class ChatPanel {
 		});
 	}
 
-	private dispose(): void {
-		if (this.disposed) {return;}
-		this.disposed = true;
-		if (this.sessionSpan) {
-			this.sessionSpan('result', {
+	private async handleWebviewMessage(msg: { command?: string; text?: unknown }): Promise<void> {
+		switch (msg.command) {
+			case 'ready':
+				await this.sendSystemContext();
+				break;
+			case 'sendMessage':
+				if (typeof msg.text === 'string' && msg.text.trim()) {
+					await this.handleUserMessage(msg.text);
+				}
+				break;
+			case 'endChat':
+				await this.endChat();
+				break;
+			case 'toolCallResponse': {
+				const resolve = typeof msg.callId === 'string' ? this.pendingToolCalls.get(msg.callId) : undefined;
+				if (resolve) {
+					this.pendingToolCalls.delete(msg.callId);
+					this.postMessage({ command: 'setLoadingText', text: 'Processing tool result' });
+					resolve(typeof msg.response === 'string' ? msg.response : String(msg.response ?? ''));
+				}
+				break;
+			}
+		}
+	}
+
+	private closeSession(): void {
+		const span = this.sessionSpan;
+		this.sessionSpan = undefined;
+		if (!span) {return;}
+		try {
+			span('result', {
 				turns: this.turnCount,
 				conversation: this.conversation.map(m => ({ role: m.role, content: m.content })),
 			});
-			this.sessionSpan.end();
-			this.sessionSpan = undefined;
+			span.end();
+		} catch (error: unknown) {
+			console.error('[Prompty] failed to finalize chat trace:', error);
 		}
-		Tracer.remove('prompty-chat');
+	}
+
+	private dispose(): void {
+		if (this.disposed) {return;}
+		this.disposed = true;
+		for (const resolve of this.pendingToolCalls.values()) {resolve('[chat closed]');}
+		this.pendingToolCalls.clear();
+		this.closeSession();
+		Tracer.remove(`prompty-chat:${this.filePath}`);
 		ChatPanel.panels.delete(this.filePath);
 		this.panel.dispose();
 	}
@@ -280,7 +289,7 @@ export class ChatPanel {
 				this.postMessage({
 					command: 'addMessage',
 					role: message.role,
-					content: message.role === 'assistant' ? renderMarkdown(message.content) : message.content,
+					content: message.role === 'assistant' ? renderMarkdown(message.content, this.allowImages) : message.content,
 					isHtml: message.role === 'assistant',
 				});
 			}
@@ -290,7 +299,7 @@ export class ChatPanel {
 		const lastMessage = this.conversation[this.conversation.length - 1];
 		if (!this.ranInitialAssistantTurn && lastMessage?.role === 'user') {
 			this.ranInitialAssistantTurn = true;
-			await this.runAssistantTurn();
+			await this.runAssistantTurn().catch(() => {});
 		}
 	}
 
@@ -299,19 +308,22 @@ export class ChatPanel {
 	 * Streams tokens into the webview with debounced DOM updates when possible.
 	 */
 	private async handleUserMessage(text: string): Promise<void> {
-		// Show user message in chat (user messages rendered as plain text for safety)
+		if (this.busy || this.disposed) {return;}
+
 		this.postMessage({ command: 'addMessage', role: 'user', content: text });
 
-		// Add user message to conversation thread
+		const checkpoint = this.conversation.length;
 		this.conversation.push({ role: 'user', content: text });
 
-		await this.runAssistantTurn();
+		const ok = await this.runAssistantTurn();
+		if (!ok) {this.conversation.length = checkpoint;}
 	}
 
 	/**
 	 * Run one assistant turn using the current conversation thread.
 	 */
-	private async runAssistantTurn(): Promise<void> {
+	private async runAssistantTurn(): Promise<boolean> {
+		this.busy = true;
 		this.postMessage({ command: 'setLoading', loading: true });
 		this.turnCount++;
 
@@ -344,7 +356,7 @@ export class ChatPanel {
 				// Streaming path: debounced chunk delivery
 				await this.handleStreamingResponse(result);
 			} else {
-				const formatted = formatAssistantResult(result, this.structuredOutputs);
+				const formatted = formatAssistantResult(result, this.structuredOutputs, this.allowImages);
 				const assistantContent = formatted.text;
 				this.conversation.push({ role: 'assistant', content: assistantContent });
 				this.postMessage({
@@ -355,11 +367,15 @@ export class ChatPanel {
 				});
 			}
 		} catch (error: unknown) {
-			const message = error instanceof Error ? error.message : String(error);
+			const message = redactSecretsInText(error instanceof Error ? error.message : String(error));
+			console.error('[Prompty] chat turn failed:', message);
 			this.postMessage({ command: 'addError', content: message });
+			return false;
 		} finally {
+			this.busy = false;
 			this.postMessage({ command: 'setLoading', loading: false });
 		}
+		return true;
 	}
 
 	/**
@@ -372,55 +388,42 @@ export class ChatPanel {
 		const DEBOUNCE_MS = 50;
 		let accumulated = '';
 		let flushTimer: ReturnType<typeof setTimeout> | undefined;
-		let needsFlush = false;
+
+		const render = (): string => this.structuredOutputs
+			? formatAssistantResult(accumulated, true, this.allowImages).html
+			: renderMarkdown(accumulated, this.allowImages);
+
+		const flush = (): void => {
+			flushTimer = undefined;
+			this.postMessage({ command: 'streamChunk', html: render() });
+		};
 
 		// Tell the webview to create the streaming message container
 		this.postMessage({ command: 'startStream', role: 'assistant' });
 
-		const flush = () => {
-			flushTimer = undefined;
-			needsFlush = false;
-			const html = this.structuredOutputs
-				? formatAssistantResult(accumulated, true).html
-				: renderMarkdown(accumulated);
-			this.postMessage({
-				command: 'streamChunk',
-				html,
-			});
-		};
-
-		// run() already processed the stream — iterate text chunks directly
-		for await (const chunk of stream) {
-			if (typeof chunk === 'string') {
-				accumulated += chunk;
-				needsFlush = true;
-				// Debounce: schedule a flush if one isn't pending
-				if (!flushTimer) {
-					flushTimer = setTimeout(flush, DEBOUNCE_MS);
+		try {
+			for await (const chunk of stream) {
+				if (typeof chunk === 'string') {
+					accumulated += chunk;
+					if (!flushTimer) {flushTimer = setTimeout(flush, DEBOUNCE_MS);}
 				}
 			}
+		} finally {
+			if (flushTimer) {
+				clearTimeout(flushTimer);
+				flushTimer = undefined;
+			}
+			if (accumulated) {
+				this.postMessage({ command: 'streamChunk', html: render() });
+				this.conversation.push({
+					role: 'assistant',
+					content: this.structuredOutputs
+						? formatAssistantResult(accumulated, true, this.allowImages).text
+						: accumulated,
+				});
+			}
+			this.postMessage({ command: 'streamEnd' });
 		}
-
-		// Final flush — clear any pending timer and send the complete content
-		if (flushTimer) {
-			clearTimeout(flushTimer);
-		}
-		if (needsFlush || accumulated) {
-			const finalMarkdown = this.structuredOutputs
-				? formatAssistantResult(accumulated, true).html
-				: accumulated;
-			this.postMessage({
-				command: 'streamChunk',
-				html: this.structuredOutputs ? finalMarkdown : renderMarkdown(finalMarkdown),
-			});
-		}
-
-		// Finalize the stream
-		this.postMessage({ command: 'streamEnd' });
-		this.conversation.push({
-			role: 'assistant',
-			content: this.structuredOutputs ? formatAssistantResult(accumulated, true).text : accumulated,
-		});
 	}
 
 	/**
@@ -433,28 +436,16 @@ export class ChatPanel {
 			if (tool.kind !== 'function') {continue;}
 			const toolName = tool.name;
 			tools[toolName] = async (args: unknown) => {
-				const argsStr = typeof args === 'string' ? args : JSON.stringify(args, null, 2);
+				const argsStr = typeof args === 'string' ? args : (JSON.stringify(args, null, 2) ?? '');
+				const callId = `tc_${++this.toolCallSeq}`;
 
-				// Show tool call in chat and wait for user response
 				return new Promise<string>((resolve) => {
-					const callId = `tc_${Date.now()}`;
-
-					// Show tool call in the webview
+					this.pendingToolCalls.set(callId, resolve);
 					this.postMessage({
 						command: 'showToolCall',
 						callId,
 						toolName,
 						arguments: argsStr,
-					});
-
-					// Listen for the response
-					const handler = this.panel.webview.onDidReceiveMessage((msg) => {
-						if (msg.command === 'toolCallResponse' && msg.callId === callId) {
-							handler.dispose();
-							// Update loading to show we're sending the result back
-							this.postMessage({ command: 'setLoadingText', text: `Processing ${toolName} result` });
-							resolve(msg.response);
-						}
 					});
 				});
 			};
@@ -467,17 +458,9 @@ export class ChatPanel {
 	 * End the chat session: close the root span, flush the tracer, and open the .tracy file.
 	 */
 	private async endChat(): Promise<void> {
-		// Close the session span — this finalizes the root frame and writes the .tracy file
-		if (this.sessionSpan) {
-			this.sessionSpan('result', {
-				turns: this.turnCount,
-				conversation: this.conversation.map(m => ({ role: m.role, content: m.content })),
-			});
-			this.sessionSpan.end();
-			this.sessionSpan = undefined;
-		}
+		this.closeSession();
 
-		Tracer.remove('prompty-chat');
+		Tracer.remove(`prompty-chat:${this.filePath}`);
 
 		const tracePath = this.promptyTracer.lastTracePath;
 		if (tracePath) {
@@ -489,7 +472,7 @@ export class ChatPanel {
 				try {
 					await window.showTextDocument(traceUri, { preview: true, viewColumn: ViewColumn.Beside });
 				} catch {
-					// Trace file is still on disk
+					console.error('[Prompty] could not open trace:', tracePath);
 				}
 			}
 		} else {

@@ -11,11 +11,7 @@ const CONNECTIONS_DIR = ".prompty";
 const CONNECTIONS_FILE = "connections.json";
 const SECRET_PREFIX = "prompty-connection-";
 
-/**
- * Hybrid connection store:
- * - Profiles (non-sensitive) in workspace `.prompty/connections.json`
- * - Secrets (API keys) in VSCode SecretStorage (OS keychain)
- */
+/** Persist connection profiles and secrets to workspace config. */
 export class ConnectionStore {
 	private readonly _onDidChange =
 		new vscode.EventEmitter<ConnectionsChangedEvent>();
@@ -39,8 +35,13 @@ export class ConnectionStore {
 
 	/** Get all connection profiles from workspace config */
 	async getProfiles(): Promise<ConnectionProfile[]> {
-		const file = await this.readConnectionsFile();
-		return file?.connections ?? [];
+		try {
+			const file = await this.readConnectionsFile();
+			return file?.connections ?? [];
+		} catch (err: unknown) {
+			console.error('[Prompty] could not read connections:', err);
+			return [];
+		}
 	}
 
 	/** Get a single profile by ID */
@@ -175,6 +176,15 @@ export class ConnectionStore {
 		);
 	}
 
+	private static isProfile(value: unknown): value is ConnectionProfile {
+		if (!value || typeof value !== 'object') {return false;}
+		const v = value as Record<string, unknown>;
+		return typeof v.id === 'string' && v.id.length > 0
+			&& typeof v.name === 'string'
+			&& typeof v.providerType === 'string'
+			&& typeof v.authType === 'string';
+	}
+
 	private async readConnectionsFile(): Promise<ConnectionsFile | null> {
 		const filePath = this.getConnectionsFilePath();
 		if (!filePath) {return null;}
@@ -190,10 +200,17 @@ export class ConnectionStore {
 			throw err;
 		}
 
-		const parsed = JSON.parse(content) as Partial<ConnectionsFile>;
+		let parsed: Partial<ConnectionsFile>;
+		try {
+			parsed = JSON.parse(content) as Partial<ConnectionsFile>;
+		} catch (err: unknown) {
+			throw new Error(
+				`${CONNECTIONS_DIR}/${CONNECTIONS_FILE} is not valid JSON (${(err as Error).message}). Fix or delete it.`
+			);
+		}
 		return {
-			version: typeof parsed.version === "number" ? parsed.version : 1,
-			connections: Array.isArray(parsed.connections) ? parsed.connections : [],
+			version: 1,
+			connections: Array.isArray(parsed.connections) ? parsed.connections.filter(ConnectionStore.isProfile) : [],
 		};
 	}
 
@@ -204,7 +221,14 @@ export class ConnectionStore {
 		}
 
 		await this.ensureConnectionsDir();
-		await fsp.writeFile(filePath, JSON.stringify(file, null, 2), "utf-8");
+		const tmpPath = `${filePath}.${process.pid}.tmp`;
+		try {
+			await fsp.writeFile(tmpPath, JSON.stringify(file, null, 2), "utf-8");
+			await fsp.rename(tmpPath, filePath);
+		} catch (err: unknown) {
+			await fsp.rm(tmpPath, { force: true });
+			throw err;
+		}
 	}
 
 	private watchConfigFile(): void {
