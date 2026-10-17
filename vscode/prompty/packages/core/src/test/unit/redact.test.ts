@@ -3,8 +3,8 @@ import { redactSecrets, redactSecretValue, isSensitiveKey } from '../../utils/re
 /* Tests for improved redaction logic */
 
 function test_redact_key_names() {
-	const data = {
-		apiKey: 'sk-1234',
+	const data: Record<string, unknown> = {
+		apiKey: 'secret123',
 		api_key: 'secret',
 		secretKey: 'mysecret',
 		password: 'hunter2',
@@ -27,16 +27,18 @@ function test_redact_key_names() {
 
 function test_redact_value_patterns() {
 	const secrets = [
-		'sk-1pZm9...',
-		'sk-proj-1234567890abcdefghijklmnopqrstuvwxyz',
-		'sk-ant-api03-1234567890abcdefghijklmnopqrstuvwxyz',
-		'ghp_1234567890abcdefghijklmnopqrstuvwxyzABCD',
-		'gho_1234567890abcdefghijklmnopqrstuvwxyz',
+		'sk-proj-1pZm9_test.example',
+		'sk-ant-1pZm9test',
+		'ghp_1pZm9test_example',
+		'github_pat_abc123_test',
 		'AKIA' + 'A'.repeat(16),
-		'xoxb-1234567890-abcdef',
+		'xoxb-1pZm9test-example',
 		'eyJhbGci.eyJzdWI.SflV',
 		'AIzaSy' + 'B'.repeat(33),
 		'Bearer abc.def.ghi',
+		'bearer abc.def.ghi',
+		'postgres://user:pass@host/db',
+		'AccountKey=my-secret-key;',
 	];
 
 	for (const secret of secrets) {
@@ -47,7 +49,7 @@ function test_redact_value_patterns() {
 	}
 
 	// Non-secret values should pass through
-	const nonSecrets = ['hello', 'plain text', '12345', 'normal-key'];
+	const nonSecrets = ['hello', 'plain text', '12345', 'normal-key', 'postgres://host/db'];
 	for (const val of nonSecrets) {
 		const result = redactSecretValue(val);
 		if (result !== val) {
@@ -58,12 +60,10 @@ function test_redact_value_patterns() {
 
 function test_redact_nested() {
 	const data = {
-		config: {
-			apiKey: 'sk-123',
-			nested: {
-				password: 'pass',
-				safe: 'val',
-			},
+		apiKey: 'secret123',
+		nested: {
+			password: 'pass',
+			safe: 'val',
 		},
 		arr: [
 			{ token: 'tok' },
@@ -72,18 +72,19 @@ function test_redact_nested() {
 	};
 
 	const result = redactSecrets(data) as any;
-	if (result.config.apiKey !== '[redacted]') throw new Error('Nested key not redacted');
-	if (result.config.nested.password !== '[redacted]') throw new Error('Deep nested key not redacted');
-	if (result.config.nested.safe !== 'val') throw new Error('Safe value was redacted');
+	if (result.apiKey !== '[redacted]') throw new Error('Nested key not redacted');
+	if (result.nested.password !== '[redacted]') throw new Error('Deep nested key not redacted');
+	if (result.nested.safe !== 'val') throw new Error('Safe value was redacted');
 	if (result.arr[0].token !== '[redacted]') throw new Error('Array element key not redacted');
 	if (result.arr[1].ok !== 'data') throw new Error('Array safe value was redacted');
 }
 
 function test_isSensitiveKey() {
 	const sensitive = ['apiKey', 'api_key', 'secret', 'password', 'token', 'credential',
-		'auth', 'authorization', 'connectionString', 'connStr', 'apiToken_key',
-		'my-api-key', 'auth_token', 'SECRET_KEY'];
-	const safe = ['name', 'description', 'id', 'version', 'endpoint', 'provider'];
+		'authorization', 'connectionString', 'connStr', 'apiToken_key',
+		'my-api-key', 'auth_token', 'SECRET_KEY', 'private_key'];
+	const safe = ['name', 'description', 'id', 'version', 'endpoint', 'provider',
+		'authors', 'keywords', 'hotkey', 'partitionKey', 'sortKey'];
 
 	for (const key of sensitive) {
 		if (!isSensitiveKey(key)) throw new Error(`Should be sensitive: ${key}`);

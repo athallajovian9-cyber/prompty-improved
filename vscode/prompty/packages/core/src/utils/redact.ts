@@ -7,18 +7,28 @@
  * - Added "connectionString" pattern
  * - Added regex matching to catch partial key names (e.g., "my_api_key_1")
  * - Added string-value redaction for known secret patterns (e.g., "sk-", "AKIA")
+ * - Fixed operator precedence bug in Bearer regex (was in || chain, now in patterns[])
+ * - Added base64-safe characters to Bearer regex (case-insensitive, allows +,/,=)
+ * - Added connection string URL credential detection
+ * - Tokenized isSensitiveKey() to avoid false positives (authors, keywords, etc.)
+ * - Non-plain objects (Date, RegExp) no longer flattened to {}
+ * - Added circular reference guard
  */
 
-export function redactSecrets(value: unknown): unknown {
+export function redactSecrets(value: unknown, seen = new WeakSet<object>()): unknown {
 	if (Array.isArray(value)) {
-		return value.map(redactSecrets);
+		return value.map(item => redactSecrets(item, seen));
 	}
-	if (!value || typeof value !== 'object') {
+	if (!value || typeof value !== 'object' || value instanceof Date || value instanceof RegExp) {
 		return redactSecretValue(value);
 	}
+	if (seen.has(value)) {
+		return '[Circular]';
+	}
+	seen.add(value);
 	const result: Record<string, unknown> = {};
 	for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-		result[key] = isSensitiveKey(key) ? '[redacted]' : redactSecrets(item);
+		result[key] = isSensitiveKey(key) ? '[redacted]' : redactSecrets(item, seen);
 	}
 	return result;
 }
@@ -27,20 +37,20 @@ export function redactSecretValue(value: unknown): unknown {
 	if (typeof value !== 'string') {
 		return value;
 	}
-	const lower = value.toLowerCase();
-	// lower reserved for future pattern extensions
-	// Redact values that look like known secret formats
+	const trimmed = value.trim();
 	const patterns: RegExp[] = [
-		/^sk-(proj-)?[a-zA-Z0-9-]+$/,          // OpenAI API key
-		/^sk-ant-[a-zA-Z0-9-]+$/,              // Anthropic API key
-		/^gh[pousr]_[a-zA-Z0-9_]+$/,             // GitHub PAT / OAuth token
-		/^AKIA[0-9A-Z]{16}$/,                   // AWS access key (uppercase)
-		/^xox[baprs]-[a-zA-Z0-9-]+$/,           // Slack token
-		/^eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+$/, // JWT
-		/^AIza[0-9A-Za-z_-]{35}$/,              // Google API key
-		/^Bearer\s+[a-zA-Z0-9._-]+$/,           // Bearer token in a string
+		/^sk-(?:proj-|svcacct-|ant-)?[a-zA-Z0-9._-]+$/,              // OpenAI & Anthropic API keys (underscore/dot support)
+		/^gh[pousr]_[a-zA-Z0-9_]+$/,                                  // GitHub PAT / OAuth token
+		/^github_pat_[a-zA-Z0-9_]+$/,                                  // GitHub fine-grained PAT
+		/^AKIA[0-9A-Z]{16}$/,                                          // AWS access key ID
+		/^xox[baprs]-[a-zA-Z0-9-]+$/,                                  // Slack token
+		/^eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+$/,     // JWT
+		/^AIza[0-9A-Za-z_-]{35}$/,                                     // Google API key
+		/^Bearer\s+[a-zA-Z0-9._~+/=-]+$/i,                             // Bearer token (case-insensitive + base64 chars)
+		/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/,            // URI with embedded user:password@
+		/(?:AccountKey|SharedAccessKey|SharedAccessSignature)=[^;]+/i, // Azure connection string secrets
 	];
-	if (patterns.some(p => p.test(value))) {
+	if (patterns.some(p => p.test(trimmed))) {
 		return '[redacted]';
 	}
 	return value;
@@ -48,21 +58,30 @@ export function redactSecretValue(value: unknown): unknown {
 
 export function isSensitiveKey(key: string): boolean {
 	const normalized = key.toLowerCase();
-	return (
-		normalized.includes('apikey') ||
-		normalized.includes('api_key') ||
-		normalized.includes('secret') ||
-		normalized.includes('password') ||
-		normalized.includes('token') ||
-		normalized.includes('credential') ||
-		normalized.includes('auth') ||                     // Added: catches "auth", "authorization"
-		normalized.includes('key') ||                       // Added: catches "api_key", "secret_key", etc.
-		normalized.includes('connectionstring') ||         // Added: connection strings
-		normalized.includes('connstr') ||                  // Added: short connection string
-		normalized.endsWith('_key') ||                     // Added: suffix pattern
-		normalized.endsWith('-key') ||                     // Added: dash key suffix
-		normalized.endsWith('_token') ||                   // Added: suffix token
-		normalized.endsWith('_secret') ||                  // Added: suffix secret
-		/^(api|app)[-_]*(key|token|secret)/i.test(key)     // Added: regex for prefix patterns
-	);
+	const directMatches = [
+		'apikey', 'api_key', 'secret', 'password', 'passwd',
+		'token', 'credential', 'connectionstring', 'connstr',
+		'authorization', 'private_key', 'privatekey',
+	];
+	if (directMatches.some(m => normalized.includes(m))) {
+		return true;
+	}
+	// Suffix patterns
+	if (normalized.endsWith('_key') || normalized.endsWith('-key') ||
+		normalized.endsWith('_token') || normalized.endsWith('_secret')) {
+		return true;
+	}
+	// Prefix patterns
+	if (/^(api|app)[-_]*(key|token|secret)/i.test(key)) {
+		return true;
+	}
+	// Tokenized word match — avoids false positives like "authors" matching "auth",
+	// or "keywords" matching "key". Only matches "auth" as a standalone word token
+	// (authorization is already caught by directMatches).
+	const tokens = key
+		.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter(Boolean);
+	return tokens.includes('auth');
 }

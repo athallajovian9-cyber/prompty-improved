@@ -3,6 +3,7 @@ import { load, prepare, Message, text as textPart } from '@prompty/core';
 import type { Prompty } from '@prompty/core';
 import { marked } from 'marked';
 import * as path from 'path';
+import { redactSecrets, redactSecretValue, isSensitiveKey } from '../utils/redact';
 import { getNonce } from '../utils/nonce';
 
 /**
@@ -121,7 +122,10 @@ export class PreviewPanel implements Disposable {
 			: 'no model';
 
 		const inputSummary = Object.keys(inputs).length > 0
-			? Object.entries(inputs).map(([k, v]) => `<span class="input-tag">${escapeHtml(k)}: ${escapeHtml(truncate(String(v), 40))}</span>`).join(' ')
+			? Object.entries(inputs).map(([k, v]) => {
+				const safeVal = isSensitiveKey(k) ? '[redacted]' : String(redactSecretValue(String(v)));
+				return `<span class="input-tag">${escapeHtml(k)}: ${escapeHtml(truncate(safeVal, 40))}</span>`;
+			}).join(' ')
 			: '<span class="muted">no inputs</span>';
 
 		// Check if agent has a thread input
@@ -596,7 +600,10 @@ function propertySection(title: string, properties: {
 		return '';
 	}
 	const cards = properties.map((prop) => {
-		const value = prop.default !== undefined ? prop.default : prop.example;
+		const hasRawValue = prop.default !== undefined ? prop.default : prop.example;
+		const value = prop.name && isSensitiveKey(prop.name) && hasRawValue !== undefined
+			? '[redacted]'
+			: hasRawValue;
 		const enumHtml = prop.enumValues && prop.enumValues.length > 0
 			? `<div>${prop.enumValues.map(item => `<span class="fm-chip">${escapeHtml(formatValue(item, 40))}</span>`).join('')}</div>`
 			: '';
@@ -624,7 +631,7 @@ function keyValueSection(title: string, entries: [string, unknown][]): string {
 	}
 	const rows = entries.map(([key, value]) => `<tr>
 		<td>${escapeHtml(key)}</td>
-		<td>${escapeHtml(formatValue(value, 140))}</td>
+		<td>${escapeHtml(isSensitiveKey(key) ? '[redacted]' : formatValue(value, 140))}</td>
 	</tr>`).join('\n');
 	return frontmatterSection(title, `<table class="fm-table">
 		<thead><tr><th>Setting</th><th>Value</th></tr></thead>
@@ -668,7 +675,7 @@ function metadataSection(metadata: Record<string, unknown>): string {
 		.join('');
 	const rows = entries
 		.filter(([key]) => !chipKeys.has(key))
-		.map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(formatValue(value, 140))}</td></tr>`)
+		.map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(isSensitiveKey(key) ? '[redacted]' : formatValue(value, 140))}</td></tr>`)
 		.join('\n');
 	const table = rows ? `<table class="fm-table"><tbody>${rows}</tbody></table>` : '';
 	return frontmatterSection('Metadata', chips || table ? `${chips}${table}` : '<div class="fm-empty">No metadata</div>');
@@ -706,12 +713,12 @@ function formatValue(value: unknown, max: number): string {
 		return '';
 	}
 	if (typeof value === 'string') {
-		return truncate(value, max);
+		return truncate(String(redactSecretValue(value)), max);
 	}
 	if (typeof value === 'number' || typeof value === 'boolean') {
 		return String(value);
 	}
-	return truncate(JSON.stringify(redactSecrets(value)), max);
+	return truncate(JSON.stringify(redactSecrets(value), null, 2), max);
 }
 
 function saveObject(value: unknown): Record<string, unknown> {
@@ -729,4 +736,3 @@ function toRecord(value: unknown): Record<string, unknown> {
 	return saveObject(value);
 }
 
-import { redactSecrets, redactSecretValue } from '../utils/redact';

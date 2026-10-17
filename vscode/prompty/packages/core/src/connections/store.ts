@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fsp from "fs/promises";
-import * as fs from "fs";
 import {
 	ConnectionProfile,
 	ConnectionsFile,
@@ -23,9 +22,17 @@ export class ConnectionStore {
 	readonly onDidChange = this._onDidChange.event;
 
 	private fileWatcher: vscode.FileSystemWatcher | undefined;
+	private writeQueue: Promise<void> = Promise.resolve();
 
 	constructor(private readonly secretStorage: vscode.SecretStorage) {
 		this.watchConfigFile();
+	}
+
+	/** Serialize file mutations to prevent concurrent read-modify-write races */
+	private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+		const next = this.writeQueue.then(fn, fn);
+		this.writeQueue = next.then(() => undefined, () => undefined);
+		return next;
 	}
 
 	// ─── Profile Operations ──────────────────────────────────────────
@@ -44,61 +51,75 @@ export class ConnectionStore {
 
 	/** Save or update a connection profile */
 	async saveProfile(profile: ConnectionProfile): Promise<void> {
-		const file = (await this.readConnectionsFile()) ?? {
-			version: 1,
-			connections: [],
-		};
+		await this.enqueueWrite(async () => {
+			const file = await this.readConnectionsFile();
+			const targetFile = file ?? {
+				version: 1,
+				connections: [],
+			};
 
-		const existingIndex = file.connections.findIndex(
-			(c) => c.id === profile.id
-		);
-		const isNew = existingIndex === -1;
+			const existingIndex = targetFile.connections.findIndex(
+				(c) => c.id === profile.id
+			);
+			const isNew = existingIndex === -1;
 
-		if (isNew) {
-			file.connections.push(profile);
-		} else {
-			file.connections[existingIndex] = profile;
-		}
+			if (isNew) {
+				targetFile.connections.push(profile);
+			} else {
+				targetFile.connections[existingIndex] = profile;
+			}
 
-		await this.writeConnectionsFile(file);
+			await this.writeConnectionsFile(targetFile);
 
-		this._onDidChange.fire(
-			isNew ? { added: [profile] } : { updated: [profile] }
-		);
+			this._onDidChange.fire(
+				isNew ? { added: [profile] } : { updated: [profile] }
+			);
+		});
 	}
 
 	/** Delete a connection profile and its secret */
 	async deleteProfile(id: string): Promise<void> {
-		const file = await this.readConnectionsFile();
-		if (!file) {return;}
+		await this.enqueueWrite(async () => {
+			const file = await this.readConnectionsFile();
+			if (!file) {return;}
 
-		const profile = file.connections.find((c) => c.id === id);
-		if (!profile) {return;}
+			const profile = file.connections.find((c) => c.id === id);
+			if (!profile) {return;}
 
-		file.connections = file.connections.filter((c) => c.id !== id);
-		await this.writeConnectionsFile(file);
-		await this.deleteSecret(id);
+			file.connections = file.connections.filter((c) => c.id !== id);
+			await this.writeConnectionsFile(file);
+			await this.deleteSecret(id);
 
-		this._onDidChange.fire({ removed: [profile] });
+			this._onDidChange.fire({ removed: [profile] });
+		});
 	}
 
 	/** Set a connection as the default for its provider type */
 	async setDefault(id: string): Promise<void> {
-		const file = await this.readConnectionsFile();
-		if (!file) {return;}
+		await this.enqueueWrite(async () => {
+			const file = await this.readConnectionsFile();
+			if (!file) {return;}
 
-		const target = file.connections.find((c) => c.id === id);
-		if (!target) {return;}
+			const target = file.connections.find((c) => c.id === id);
+			if (!target) {return;}
 
-		// Unset other defaults of the same provider type
-		for (const conn of file.connections) {
-			if (conn.providerType === target.providerType) {
-				conn.isDefault = conn.id === id;
+			// Collect all profiles whose isDefault changed
+			const updated: ConnectionProfile[] = [];
+			for (const conn of file.connections) {
+				if (conn.providerType === target.providerType) {
+					const wasDefault = conn.isDefault ?? false;
+					conn.isDefault = conn.id === id;
+					if (wasDefault !== conn.isDefault) {
+						updated.push(conn);
+					}
+				}
 			}
-		}
 
-		await this.writeConnectionsFile(file);
-		this._onDidChange.fire({ updated: [target] });
+			await this.writeConnectionsFile(file);
+			if (updated.length > 0) {
+				this._onDidChange.fire({ updated });
+			}
+		});
 	}
 
 	/** Get the default connection for a provider type */
@@ -158,12 +179,22 @@ export class ConnectionStore {
 		const filePath = this.getConnectionsFilePath();
 		if (!filePath) {return null;}
 
+		let content: string;
 		try {
-			const content = await fsp.readFile(filePath, "utf-8");
-			return JSON.parse(content) as ConnectionsFile;
-		} catch {
-			return null;
+			content = await fsp.readFile(filePath, "utf-8");
+		} catch (err: unknown) {
+			// File doesn't exist yet — return null so caller initializes
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				return null;
+			}
+			throw err;
 		}
+
+		const parsed = JSON.parse(content) as Partial<ConnectionsFile>;
+		return {
+			version: typeof parsed.version === "number" ? parsed.version : 1,
+			connections: Array.isArray(parsed.connections) ? parsed.connections : [],
+		};
 	}
 
 	private async writeConnectionsFile(file: ConnectionsFile): Promise<void> {
